@@ -1,1 +1,69 @@
-# 0621-community-chat-voice-platform-messaging-service
+# messaging_service
+
+Owns community text messages, thread replies, reactions and image attachments for
+the chat platform. The service keeps a local projection of the community,
+conversation and moderation state it needs, so the message path never makes a
+synchronous call to another service (`docs/architecture.md`, ADR-001).
+
+## Responsibilities
+
+- `POST /channels/{channel_id}/messages`, `GET /channels/{channel_id}/messages`
+- `POST /conversations/{conversation_id}/messages`, `GET /conversations/{conversation_id}/messages`
+- `GET /messages/{message_id}/thread`, `PATCH /messages/{message_id}`, `DELETE /messages/{message_id}`
+- `PUT|DELETE /messages/{message_id}/reactions/{emoji}`
+- `POST /attachments` (two-phase presigned upload, ADR-003)
+- `POST /internal/realtime/user-scopes` (API-003, service-token authenticated)
+- `GET /healthz`, `GET /readyz`, `GET /metrics`
+
+Sending is idempotent per `(container, author, client_message_id)` (ADR-002):
+a replay returns the stored message with `201` and emits no second event.
+
+## Events
+
+Consumed (projections, deduped on `envelope.event_id` and version-guarded):
+`EVT-002 community.member_changed`, `EVT-003 community.channel_changed`,
+`EVT-005 automod.rules_changed`, `EVT-008 conversation.changed`.
+
+Produced: `EVT-009 message.changed` on `message_events`, keyed by container id,
+written to `event_outbox` inside the message transaction and relayed to Kafka by
+the outbox relay.
+
+## Layout
+
+```
+cmd/server            process wiring, probes, graceful shutdown
+internal/auth         local access-token verification + service token
+internal/config       env-backed configuration
+internal/database     embedded migrations (golang-migrate)
+internal/eventbus     outbox relay, projection consumer, Kafka adapter
+internal/handler      gin routes, middleware, error mapping
+internal/health       liveness/readiness checks
+internal/models       domain rows, event payloads, envelope, cursors, errors
+internal/objectstore  presigned S3 attachments
+internal/observability metrics and trace propagation
+internal/repository   pgx repositories and transaction seam
+internal/service      business logic (send, automod, history, attachments)
+tests/unit            service/repository tests against fakes
+tests/integration     httptest-level API tests against the real router
+```
+
+## Running
+
+```bash
+cp .env.example .env      # then fill in real values
+make run                  # applies migrations, starts HTTP + consumers
+make test                 # full suite, no database/broker/storage needed
+make cover                # suite + coverage gate (>= 80%)
+make build                # distroless-ready binary in bin/
+make docker-build
+```
+
+Schema changes are additive migrations under `internal/database/migrations`;
+`make run` applies them at startup before the HTTP listener opens.
+
+## Deliberate divergences
+
+- `attachments.idempotency_key` (plus partial unique index
+  `uq_attachments_idempotency`) is an additive column so the documented
+  `Idempotency-Key` request header has a storage home. The published DDL in
+  `docs/architecture.md` §6 has no column for it.

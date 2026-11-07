@@ -1,0 +1,976 @@
+openapi: "3.0.3"
+info:
+  title: messaging_service API
+  version: "1.0.0"
+  description: >
+    Messages, threads, reactions, mentions, and image attachments for text channels
+    and private conversations. Enforces community membership, mute state, and automod
+    rules from local event projections, and answers realtime subscription-scope checks
+    for the realtime gateway (API-003).
+servers:
+  - url: /
+
+tags:
+  - name: attachments
+  - name: channel-messages
+  - name: conversation-messages
+  - name: messages
+  - name: reactions
+  - name: internal-realtime
+  - name: probes
+
+paths:
+  /attachments:
+    post:
+      operationId: createAttachment
+      summary: Reserve an image attachment and get a presigned upload URL
+      description: >
+        Validates the declared image type and size, stores a pending attachment record,
+        and returns a presigned PUT URL (15-minute TTL). The upload itself goes directly
+        from the client to S3-compatible storage. The attachment must be referenced by a
+        message send within 24 hours or it is garbage-collected. Retries may reuse an
+        `Idempotency-Key` header to obtain the same attachment instead of a new one.
+      tags: [attachments]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: Client-supplied key making repeated creation attempts return the original attachment.
+          schema:
+            type: string
+            maxLength: 128
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAttachmentRequest'
+      responses:
+        "201":
+          description: Attachment slot created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttachmentCreated'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "413":
+          description: Declared size exceeds the 10 MB limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: image_too_large
+                detail: Images may be at most 10 MB.
+        "415":
+          description: Declared content type is not a supported image type
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: unsupported_image_type
+                detail: Supported types are image/png, image/jpeg, image/gif, image/webp.
+        "422":
+          $ref: '#/components/responses/UnprocessableEntity'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /channels/{channel_id}/messages:
+    post:
+      operationId: sendChannelMessage
+      summary: Send a message to a text channel
+      tags: [channel-messages]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ChannelId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendMessageRequest'
+      responses:
+        "201":
+          description: Message created (or original returned when client_message_id repeats)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          description: Caller is muted or not an active member of the channel's community
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                memberMuted:
+                  value:
+                    error: member_muted
+                    detail: You are muted in this community until 2026-01-15T10:00:00Z. You can appeal this sanction.
+                notAMember:
+                  value:
+                    error: not_a_member
+                    detail: You are not a member of this community.
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "413":
+          description: Referenced attachment exceeds 10 MB
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: image_too_large
+                detail: The referenced image exceeds the 10 MB limit.
+        "415":
+          description: Referenced attachment has an unsupported image type
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: unsupported_image_type
+                detail: The referenced file is not a supported image type.
+        "422":
+          description: >
+            Validation failure or automod block. Automod blocks return
+            `422 blocked_by_automod` with the rule category in `detail`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                blockedByAutomod:
+                  value:
+                    error: blocked_by_automod
+                    detail: Message blocked by automatic filters (category banned_words).
+                tooLong:
+                  value:
+                    error: content_too_long
+                    detail: Message content must be at most 4000 characters.
+        "500":
+          $ref: '#/components/responses/InternalError'
+    get:
+      operationId: listChannelMessages
+      summary: Page through a channel's history (newest-first, cursor-based)
+      description: Supports an `after` cursor for reconnect catch-up and a `before` cursor for scrollback.
+      tags: [channel-messages]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ChannelId'
+        - name: before
+          in: query
+          required: false
+          description: Opaque cursor; returns messages older than it.
+          schema:
+            type: string
+        - name: after
+          in: query
+          required: false
+          description: Opaque cursor; returns messages newer than it in chronological order (reconnect catch-up).
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        "200":
+          description: Message page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessagePage'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          description: Caller is not an active member of the channel's community
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: not_a_member
+                detail: You are not a member of this community.
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /conversations/{conversation_id}/messages:
+    post:
+      operationId: sendConversationMessage
+      summary: Send a message to a direct or group private conversation
+      tags: [conversation-messages]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ConversationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendMessageRequest'
+      responses:
+        "201":
+          description: Message created (or original returned when client_message_id repeats)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          description: Caller is not a current participant of the conversation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: not_a_member
+                detail: You are not a participant of this conversation.
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "413":
+          $ref: '#/components/responses/ImageTooLarge'
+        "415":
+          $ref: '#/components/responses/UnsupportedImageType'
+        "422":
+          $ref: '#/components/responses/UnprocessableEntity'
+        "500":
+          $ref: '#/components/responses/InternalError'
+    get:
+      operationId: listConversationMessages
+      summary: Page through a conversation's history (newest-first, cursor-based)
+      tags: [conversation-messages]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ConversationId'
+        - name: before
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: after
+          in: query
+          required: false
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        "200":
+          description: Message page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessagePage'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          description: Caller is not a current participant of the conversation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: not_a_member
+                detail: You are not a participant of this conversation.
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /messages/{message_id}/thread:
+    get:
+      operationId: getMessageThread
+      summary: Read a thread (root message plus replies, cursor-paged)
+      tags: [messages]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MessageId'
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque cursor over replies.
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        "200":
+          description: Thread page with reply count
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ThreadPage'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          description: Caller may not read the container holding the thread
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: not_a_member
+                detail: You are not a member of this community.
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /messages/{message_id}:
+    patch:
+      operationId: editMessage
+      summary: Edit own message content
+      description: Author only. Automod rules are re-evaluated on the new content.
+      tags: [messages]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MessageId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EditMessageRequest'
+      responses:
+        "200":
+          description: Updated message
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          description: Caller is not the author (or lost access to the container)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: not_author
+                detail: Only the author can edit a message.
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "409":
+          description: Message is deleted and cannot be edited
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: message_deleted
+                detail: Deleted messages cannot be edited.
+        "422":
+          description: Content too long, or automod blocked/removed the new content
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: blocked_by_automod
+                detail: Message blocked by automatic filters (category spam).
+        "500":
+          $ref: '#/components/responses/InternalError'
+    delete:
+      operationId: deleteMessage
+      summary: Delete own message (soft delete; content removed for everyone)
+      description: Author only. Idempotent — deleting an already-deleted message still returns 204.
+      tags: [messages]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MessageId'
+      responses:
+        "204":
+          description: Message deleted (or already deleted)
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          description: Caller is not the author
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: not_author
+                detail: Only the author can delete a message.
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /messages/{message_id}/reactions/{emoji}:
+    put:
+      operationId: addReaction
+      summary: Add the caller's reaction with an emoji
+      description: Idempotent — reacting twice with the same emoji keeps the count unchanged.
+      tags: [reactions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MessageId'
+        - $ref: '#/components/parameters/Emoji'
+      responses:
+        "200":
+          description: Aggregated reaction summary for the message
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReactionSummaryResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          description: Caller may not read the message's container
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: not_a_member
+                detail: You are not a member of this community.
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "500":
+          $ref: '#/components/responses/InternalError'
+    delete:
+      operationId: removeReaction
+      summary: Remove the caller's reaction with an emoji
+      description: Idempotent — removing a reaction the caller does not have keeps counts unchanged.
+      tags: [reactions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MessageId'
+        - $ref: '#/components/parameters/Emoji'
+      responses:
+        "200":
+          description: Aggregated reaction summary for the message
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReactionSummaryResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          description: Caller may not read the message's container
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: not_a_member
+                detail: You are not a member of this community.
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /internal/realtime/user-scopes:
+    post:
+      operationId: getUserRealtimeScopes
+      summary: Realtime subscription scopes for a user (API-003, consumed by realtime_gateway)
+      description: >
+        Internal endpoint under `/internal/*`, never exposed through the public ingress.
+        Authenticated with the per-edge service token. Answers from local membership and
+        conversation projections; an unknown user yields 200 with empty lists.
+      tags: [internal-realtime]
+      security:
+        - bearerServiceToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserScopesRequest'
+      responses:
+        "200":
+          description: The user's current subscription scopes
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserScopesResponse'
+        "400":
+          description: Malformed body
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: Missing or invalid service token
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Unexpected server error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "503":
+          description: Underlying dependencies temporarily unavailable
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /healthz:
+    get:
+      operationId: getLiveness
+      summary: Liveness probe
+      description: Lightweight process check; must not fail on transient dependency hiccups.
+      tags: [probes]
+      security: []
+      responses:
+        "200":
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /readyz:
+    get:
+      operationId: getReadiness
+      summary: Readiness probe
+      description: Verifies PostgreSQL pool, Kafka producer/consumer connectivity, and S3-compatible storage reachability; returns 503 once shutdown starts.
+      tags: [probes]
+      security: []
+      responses:
+        "200":
+          description: Ready to receive traffic
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        "503":
+          description: A critical dependency is not ready (or the process is shutting down)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+components:
+  parameters:
+    ChannelId:
+      name: channel_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ConversationId:
+      name: conversation_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    MessageId:
+      name: message_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    Emoji:
+      name: emoji
+      in: path
+      required: true
+      description: URL-encoded Unicode emoji (1-32 characters).
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 32
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 50
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        Short-lived access token issued by identity_service. Verified locally against
+        identity's public verification keys distributed through deployment configuration
+        (claims: sub, sid, email_verified, exp, iat, iss, aud). No runtime call to
+        identity_service.
+    bearerServiceToken:
+      type: http
+      scheme: bearer
+      description: Per-edge service token for `/internal/*` endpoints, provisioned via deployment secrets.
+
+  responses:
+    BadRequest:
+      description: Request validation failed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Unauthorized:
+      description: Authentication required
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    UnprocessableEntity:
+      description: Business rule violation
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ImageTooLarge:
+      description: Attachment exceeds the 10 MB limit
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: image_too_large
+            detail: Images may be at most 10 MB.
+    UnsupportedImageType:
+      description: Attachment type is not a supported image type
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: unsupported_image_type
+            detail: Supported types are image/png, image/jpeg, image/gif, image/webp.
+    InternalError:
+      description: Unexpected server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Stable machine-readable error code, snake_case.
+        detail:
+          type: string
+          description: Human-readable explanation.
+
+    HealthStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, unavailable]
+
+    CreateAttachmentRequest:
+      type: object
+      required: [filename, content_type, size_bytes]
+      properties:
+        filename:
+          type: string
+          minLength: 1
+          maxLength: 255
+        content_type:
+          type: string
+          enum: [image/png, image/jpeg, image/gif, image/webp]
+        size_bytes:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 10485760
+
+    AttachmentCreated:
+      type: object
+      required: [attachment_id, upload_url, upload_url_expires_at]
+      properties:
+        attachment_id:
+          type: string
+          format: uuid
+        upload_url:
+          type: string
+          format: uri
+          description: Presigned PUT URL; the upload must use the declared content type.
+        upload_url_expires_at:
+          type: string
+          format: date-time
+
+    SendMessageRequest:
+      type: object
+      required: [client_message_id, content]
+      properties:
+        client_message_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: >
+            Client-generated idempotency key. A repeated (container, author,
+            client_message_id) send returns the original message instead of duplicating it.
+        content:
+          type: string
+          minLength: 1
+          maxLength: 4000
+          description: Message text; mentions are expressed as `<@{user_id}>` tokens.
+        attachment_ids:
+          type: array
+          maxItems: 10
+          uniqueItems: true
+          items:
+            type: string
+            format: uuid
+          description: Attachments previously uploaded by the same author.
+        thread_root_id:
+          type: string
+          format: uuid
+          description: Root message to reply to; omitted for a top-level message.
+
+    Attachment:
+      type: object
+      required: [attachment_id, content_type, size_bytes, download_url, url_expires_at]
+      properties:
+        attachment_id:
+          type: string
+          format: uuid
+        content_type:
+          type: string
+          enum: [image/png, image/jpeg, image/gif, image/webp]
+        size_bytes:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 10485760
+        download_url:
+          type: string
+          format: uri
+          description: Short-lived presigned GET URL; refresh through message history when expired.
+        url_expires_at:
+          type: string
+          format: date-time
+
+    ReactionSummary:
+      type: object
+      required: [emoji, count]
+      properties:
+        emoji:
+          type: string
+          minLength: 1
+          maxLength: 32
+        count:
+          type: integer
+          minimum: 1
+
+    Message:
+      type: object
+      required:
+        - message_id
+        - container_type
+        - container_id
+        - community_id
+        - author_user_id
+        - thread_root_id
+        - content
+        - attachments
+        - mentioned_user_ids
+        - reactions
+        - deletion_reason
+        - created_at
+        - edited_at
+        - deleted_at
+        - message_version
+      properties:
+        message_id:
+          type: string
+          format: uuid
+        container_type:
+          type: string
+          enum: [channel, conversation]
+        container_id:
+          type: string
+          format: uuid
+          description: channel_id or conversation_id.
+        community_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: Set for channel messages; null for conversation messages.
+        author_user_id:
+          type: string
+          format: uuid
+        thread_root_id:
+          type: string
+          format: uuid
+          nullable: true
+        content:
+          type: string
+          nullable: true
+          maxLength: 4000
+          description: Null on tombstoned (deleted) messages.
+        attachments:
+          type: array
+          maxItems: 10
+          items:
+            $ref: '#/components/schemas/Attachment'
+        mentioned_user_ids:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            format: uuid
+        reactions:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReactionSummary'
+        deletion_reason:
+          type: string
+          nullable: true
+          enum: [author, automod, null]
+        created_at:
+          type: string
+          format: date-time
+        edited_at:
+          type: string
+          format: date-time
+          nullable: true
+        deleted_at:
+          type: string
+          format: date-time
+          nullable: true
+        message_version:
+          type: integer
+          minimum: 1
+          description: Monotonic per-message version; identical on deduplicated re-sends.
+
+    MessagePage:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Message'
+        next_cursor:
+          type: string
+          nullable: true
+        has_more:
+          type: boolean
+
+    ThreadPage:
+      type: object
+      required: [root, reply_count, replies, next_cursor, has_more]
+      properties:
+        root:
+          $ref: '#/components/schemas/Message'
+        reply_count:
+          type: integer
+          minimum: 0
+        replies:
+          type: array
+          items:
+            $ref: '#/components/schemas/Message'
+        next_cursor:
+          type: string
+          nullable: true
+        has_more:
+          type: boolean
+
+    EditMessageRequest:
+      type: object
+      required: [content]
+      properties:
+        content:
+          type: string
+          minLength: 1
+          maxLength: 4000
+
+    ReactionSummaryResponse:
+      type: object
+      required: [message_id, reactions]
+      properties:
+        message_id:
+          type: string
+          format: uuid
+        reactions:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReactionSummary'
+
+    UserScopesRequest:
+      type: object
+      additionalProperties: false
+      required: [user_id]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+
+    UserScopesResponse:
+      type: object
+      required: [user_id, community_ids, conversation_ids, generated_at]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        community_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          uniqueItems: true
+          description: Communities where the user is an active member (muted included; removed/banned excluded).
+        conversation_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          uniqueItems: true
+          description: Private conversations (direct and group) where the user is a current participant.
+        generated_at:
+          type: string
+          format: date-time

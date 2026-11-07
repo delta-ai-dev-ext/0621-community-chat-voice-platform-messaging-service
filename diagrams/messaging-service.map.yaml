@@ -1,0 +1,272 @@
+schema_version: 2
+diagram_id: messaging-service
+mode: service
+orientation: LR
+scope: 'messaging_service service view: public messaging API, realtime scope oracle,
+  PostgreSQL projections, attachment bucket and Kafka event flows.'
+sources:
+- path: docs/architecture.md
+  sha256: 12f6abd90936579ccf16d54a109a51d5416a02790b4b225a0ec089248f525330
+- path: docs/openapi_spec.yaml
+  sha256: 405ddcd37612e272047b37362c6c26dce6bdfd8f14048e3acc5f4af88a5a62d5
+- path: docs/user_stories.md
+  sha256: 6c264ee9e3766cd182e1cca2ba42dc1d0edac2039d3b60853f8af16be6169972
+- path: docs/decisions/ADR-001-local-projections-over-sync-authorization.md
+  sha256: b82a09dabe999bd893fdba3d279efb79e7b98eddfd52920afd56e329cf5c3964
+- path: docs/decisions/ADR-002-client-message-id-idempotent-send.md
+  sha256: 0fa115834fda74cace4e8a7faf950b919b181cc1dc3214d057b719cb9bafbcc2
+- path: docs/decisions/ADR-003-two-phase-presigned-attachment-uploads.md
+  sha256: 07339416761bd53a20aeefa6c330816252733cc9cb6c3ade93364014a56be239
+entities:
+- id: kafka
+  name: Kafka
+  label: Kafka event bus
+  kind: broker
+  technology: kafka
+  role: outbound
+  row: 20
+  evidence:
+  - path: docs/architecture.md
+    quote: a relay loop publishes to Kafka
+  - path: docs/architecture.md
+    quote: '### 3.1 Consumed projections (at-least-once, dedupe on `envelope.event_id`)'
+- id: clients
+  label: Chat clients (members)
+  kind: annotation
+  role: inbound
+  row: 300
+  evidence:
+  - path: docs/user_stories.md
+    quote: '**As a** member,'
+  - path: docs/user_stories.md
+    quote: '**I want to** post a message (up to 4,000 characters) in a text channel
+      of a community I belong to,'
+- id: svc
+  name: messaging_service
+  label: messaging_service
+  kind: service
+  technology: kubernetes-pod
+  role: service
+  row: 260
+  evidence:
+  - path: docs/architecture.md
+    quote: '| HTTP API layer | Public endpoints (attachment reservation, message send/read/edit/delete,
+      reactions, thread) and the internal `POST /internal/realtime/user-scopes` (API-003).
+      Verifies access tokens locally against identity''s public verification keys.
+      |'
+  - path: docs/openapi_spec.yaml
+    quote: 'title: messaging_service API'
+- id: rtgw
+  label: realtime_gateway
+  kind: annotation
+  role: inbound
+  row: 450
+  evidence:
+  - path: docs/openapi_spec.yaml
+    quote: Realtime subscription scopes for a user (API-003, consumed by realtime_gateway)
+  - path: docs/architecture.md
+    quote: '`realtime_gateway` calls `POST /internal/realtime/user-scopes`'
+- id: db
+  label: Messaging PostgreSQL
+  kind: database
+  technology: postgresql
+  role: outbound
+  row: 330
+  evidence:
+  - path: docs/architecture.md
+    quote: '## 6. PostgreSQL Database Schema'
+  - path: docs/architecture.md
+    quote: Owned and defined here. Types are PostgreSQL-native.
+- id: s3
+  label: Message attachments bucket
+  kind: storage
+  technology: s3-compatible
+  role: outbound
+  row: 400
+  evidence:
+  - path: docs/architecture.md
+    quote: Attachment lifecycle (S3-compatible storage, private bucket)
+relationships:
+- id: r-clients
+  source: clients
+  target: svc
+  type: request
+  direction: forward
+  interaction:
+    channel: direct
+    purpose: message, history, reaction and attachment API calls
+    protocol: REST
+    exchange_id: public-messaging-api
+  evidence:
+  - path: docs/user_stories.md
+    quote: '- Given I declare `content_type` `image/png`, `image/jpeg`, `image/gif`,
+      or `image/webp` and `size_bytes` ≤ 10 MB, when I request an attachment, then
+      I receive an `attachment_id` and a presigned upload URL that expires in 15 minutes.'
+  - path: docs/user_stories.md
+    quote: '- Pushing missed events through the WebSocket (the gateway replays nothing;
+      catch-up is REST-only).'
+- id: r-rtgw
+  source: rtgw
+  target: svc
+  type: request
+  direction: forward
+  interaction:
+    channel: direct
+    purpose: realtime subscription scope query
+    exchange_id: realtime-scope-query
+  evidence:
+  - path: docs/architecture.md
+    quote: '`realtime_gateway` calls `POST /internal/realtime/user-scopes`'
+  - path: docs/openapi_spec.yaml
+    quote: Authenticated with the per-edge service token.
+- id: r-db
+  source: svc
+  target: db
+  type: ownership
+  evidence:
+  - path: docs/architecture.md
+    quote: Owned and defined here. Types are PostgreSQL-native.
+- id: r-s3
+  source: svc
+  target: s3
+  type: storage
+  evidence:
+  - path: docs/decisions/ADR-003-two-phase-presigned-attachment-uploads.md
+    quote: 'Two-phase flow backed by S3-compatible storage (private bucket):'
+- id: r-prod
+  source: svc
+  target: kafka
+  type: event
+  direction: forward
+  interaction:
+    channel: messaging
+    purpose: message change publication
+    protocol: Kafka
+  messaging:
+    role: producer
+    topic: message_events
+  evidence:
+  - path: docs/architecture.md
+    quote: EVT-009 `message_changed` on `message_events`, keyed by `container_id`,
+      version 1,
+  - path: docs/architecture.md
+    quote: a relay loop publishes to Kafka
+- id: r-cons-community
+  source: kafka
+  target: svc
+  type: event
+  direction: forward
+  interaction:
+    channel: messaging
+    purpose: membership and text channel projections
+    protocol: Kafka
+  messaging:
+    role: consumer
+    topic: community_events
+  evidence:
+  - path: docs/architecture.md
+    quote: '| `community_events` | EVT-002 `community_member_changed` | `community_members`
+      projection (status active/removed, banned, `muted_until`, role ids) — upsert
+      only when `member_version` is newer |'
+  - path: docs/architecture.md
+    quote: a relay loop publishes to Kafka
+- id: r-cons-social
+  source: kafka
+  target: svc
+  type: event
+  direction: forward
+  interaction:
+    channel: messaging
+    purpose: conversation and participant projections
+    protocol: Kafka
+  messaging:
+    role: consumer
+    topic: social_events
+  evidence:
+  - path: docs/architecture.md
+    quote: '| `social_events` | EVT-008 `conversation_changed` | `conversations` +
+      `conversation_participants` projections (kind, name, current participants) —
+      upsert only when `conversation_version` is newer |'
+  - path: docs/architecture.md
+    quote: a relay loop publishes to Kafka
+- id: r-cons-moderation
+  source: kafka
+  target: svc
+  type: event
+  direction: forward
+  interaction:
+    channel: messaging
+    purpose: automod rule set projection
+    protocol: Kafka
+  messaging:
+    role: consumer
+    topic: moderation_events
+  evidence:
+  - path: docs/architecture.md
+    quote: '| `moderation_events` | EVT-005 `automod_rules_changed` | `automod_rule_sets`
+      projection (full rule-set snapshot replaced per version) |'
+  - path: docs/architecture.md
+    quote: a relay loop publishes to Kafka
+view:
+  entities:
+  - kafka
+  - clients
+  - svc
+  - rtgw
+  - db
+  - s3
+  groups: []
+  edges:
+  - id: e-clients
+    source: clients
+    target: svc
+    relationships:
+    - r-clients
+    label: REST
+    flow: forward
+  - id: e-rtgw
+    source: rtgw
+    target: svc
+    relationships:
+    - r-rtgw
+    label: service token
+    flow: forward
+  - id: e-db
+    source: svc
+    target: db
+    relationships:
+    - r-db
+    label: SQL
+    flow: forward
+  - id: e-s3
+    source: svc
+    target: s3
+    relationships:
+    - r-s3
+    label: presigned PUT/GET
+    flow: forward
+  - id: e-prod
+    source: svc
+    target: kafka
+    relationships:
+    - r-prod
+    label: 'Producers
+
+      messaging_service:message_events'
+    flow: forward
+  - id: e-cons
+    source: kafka
+    target: svc
+    relationships:
+    - r-cons-community
+    - r-cons-social
+    - r-cons-moderation
+    label: 'Consumers
+
+      messaging_service:community_events
+
+      messaging_service:moderation_events
+
+      messaging_service:social_events'
+    flow: feedback
+  omitted: []
