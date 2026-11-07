@@ -1,5 +1,18 @@
-bin/
-coverage.out
-coverage.html
-.env
+# Build artefacts and local-only files.
+#
+# Artefact patterns are anchored to the repository root (`/`) on purpose: an
+# unanchored pattern such as `bin/` also matches nested source directories, and
+# a broad ignore rule is how a source file (in particular the process
+# entrypoint) silently drops out of a commit without anyone noticing.
+/bin/
+/coverage.out
+/coverage.html
 *.test
+# `.env` stays global: a local secrets file must never be committed from any
+# directory, not just the repository root.
+.env
+
+# `cmd/server/main.go` is the process entrypoint described in
+# docs/engineering_guide.md; it is source, never an artefact. Re-include it
+# explicitly so a future ignore rule cannot discard it again.
+!/cmd/server/main.go
